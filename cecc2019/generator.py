@@ -3,6 +3,7 @@ import itertools
 import json
 import collections
 import sys
+import math
 
 import pickle
 import os.path
@@ -143,40 +144,100 @@ color_free = {
     'alpha': 1
 }
 
-worksheet.merge_range('A1:D1', 'CECC 2019 Bookings', merge_format)
+
+class Renderer(object):
+    def __init__(self, worksheet, offset, key, rooms, double_col=True):
+        self.worksheet = worksheet
+        self.room_size = max([x['beds'] for x in rooms])
+        self.double_col = double_col
+        self.title_span = 2*4+1 if self.double_col else 4
+        self.offset = offset
+        self.key = key
+        self.rooms = rooms
+        self.room_offset = None
+        self.offset_final = None
+        self.edits = []
+
+    def draw_type(self):
+        self.worksheet.merge_range(self.offset, 0, self.offset, self.title_span - 1, get_room_label(self.key), room_type_format)
+        self.offset += 1
+
+    def draw_headings(self):
+        self.worksheet.write_string(self.offset, 0, 'Room ID')
+        self.worksheet.merge_range(self.offset, 1, self.offset, 3, 'Name Surname', names_format)
+        self.offset += 1
+
+        if not self.double_col:
+            return
+
+        self.offset -= 1
+        self.worksheet.write_string(self.offset, 5, 'Room ID')
+        self.worksheet.merge_range(self.offset, 6, self.offset, 8, 'Name Surname', names_format)
+        self.offset += 1
+
+    def begin_rooms(self):
+        self.room_offset = self.offset
+        nroom_rows = len(self.rooms)
+        if self.double_col:
+            nroom_rows = math.ceil(nroom_rows/2.)
+
+        self.offset_final = self.room_offset + (self.room_size + 1) * nroom_rows
+
+    def get_room_start(self, idx):
+        if not self.double_col:
+            return 0, self.room_offset + idx * (self.room_size + 1)
+
+        x_coord = 0 if (idx & 1) == 0 else 5
+        y_coord = self.room_offset + idx//2 * (self.room_size + 1)
+        return x_coord, y_coord
+
+    def draw_room(self, idx):
+        coords = self.get_room_start(idx)
+        room = self.rooms[idx]
+        room_id = '%s' % get_room_id(room['id'])
+        num_ppl = len(room['people'])
+        num_beds = room['beds']
+
+        # room id
+        self.worksheet.merge_range(coords[1], coords[0], coords[1] + self.room_size - 1, coords[0], room_id, room_id_format)
+
+        offset = coords[1]
+        for cbed in range(num_beds):
+            cstr = 'Free' if cbed >= num_ppl else (room['people'][cbed] if show_names else 'Taken')
+            cstr = '%d. %s' % (cbed + 1, cstr)
+            cstyle = name_format_empty if cbed >= num_ppl else name_format
+
+            self.edits.append({
+                'row': offset, 'col': coords[0] + 1, 'lcol': coords[0] + 1,
+                'body': cstr, 'taken': cbed < num_ppl
+            })
+            self.worksheet.merge_range(offset, coords[0] + 1, offset, coords[0] + 3, cstr, cstyle)
+            offset += 1
+        self.offset = offset
+
+
+worksheet.merge_range('A1:I1', 'CECC 2019 Bookings', merge_format)
 # worksheet.set_column(0, 1, 10)
 
-offset = 0
+offset = 1
 booking_data.sort(key=sorter)
 booking_data_disp = booking_data if show_lectors else filter(filterer, booking_data)
 edits = []
 
 for k, g in itertools.groupby(booking_data_disp, key=lambda x: x['type']):
-    offset += 2
-    worksheet.merge_range(offset, 0, offset, 3, get_room_label(k), room_type_format)
-    offset += 1
-    worksheet.write_string(offset, 0, 'Room ID')
-    worksheet.merge_range(offset, 1, offset, 3, 'Name Surname', names_format)
+    g = list(g)
+    renderer = Renderer(worksheet, offset, k, g, True)
+    renderer.draw_type()
+    renderer.draw_headings()
+    renderer.begin_rooms()
+    for i in range(len(g)):
+        renderer.draw_room(i)
 
-    for room in g:
-        offset += 1
-        # worksheet.write_string(offset, 0, '%s' % get_room_id(room['id']))
-        worksheet.merge_range(offset, 0, offset + room['beds'] - 1, 0, '%s' % get_room_id(room['id']), room_id_format)
-        num_ppl = len(room['people'])
-
-        for cbed in range(room['beds']):
-            cstr = 'Free' if cbed >= num_ppl else (room['people'][cbed] if show_names else 'Taken')
-            cstr = '%d. %s' % (cbed + 1, cstr)
-            cstyle = name_format_empty if cbed >= num_ppl else name_format
-
-            edits.append({
-                'row': offset, 'col': 1, 'body': cstr, 'taken': cbed < num_ppl
-            })
-            worksheet.merge_range(offset, 1, offset, 3, cstr, cstyle)
-            offset += 1
+    offset = renderer.offset + 1
+    edits += renderer.edits
 
 workbook.close()
-print(json.dumps(edits, indent=2))
+# print(json.dumps(edits, indent=2))
 
 # Google Docs code
 # https://developers.google.com/sheets/api/samples/writing
@@ -184,7 +245,7 @@ print(json.dumps(edits, indent=2))
 # https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/request#PasteDataRequest
 # https://developers.google.com/sheets/api/guides/batchupdate
 # https://developers.google.com/resources/api-libraries/documentation/sheets/v4/python/latest/sheets_v4.spreadsheets.html#batchUpdate
-#
+
 creds = None
 # The file token.pickle stores the user's access and refresh tokens, and is
 # created automatically when the authorization flow completes for the first
@@ -220,57 +281,58 @@ for ed in edits:
         'values': [[ed['body']]]
     })
 
-    edits_map[ed['row']][ed['col']] = ed['taken']
+    for i in range(ed['col'], ed['lcol']+1):
+        edits_map[ed['row']][i] = ed['taken']
 
-first_edit = min(edits, key=lambda x: x['row'])
-last_edit = max(edits, key=lambda x: x['row'])
-frow, fcol = first_edit['row'], first_edit['col']
-lrow, lcol = last_edit['row'], last_edit['col']
-
-# Get sheet ID
-spreadsheet_info = sheet.get(spreadsheetId=SPREADSHEET_ID, ranges=[]).execute()
+first_edit_row = min(edits, key=lambda x: x['row'])
+last_edit_row = max(edits, key=lambda x: x['row'])
+first_edit_col = min(edits, key=lambda x: x['col'])
+last_edit_col = max(edits, key=lambda x: x['col'])
+frow, fcol = first_edit_row['row'], first_edit_col['col']
+lrow, lcol = last_edit_row['row'], last_edit_col['col']
 
 cell_request = {
     # 'range': {
-    #     'sheetId': spreadsheet_info['sheets'][0]['properties']['sheetId'],
+    #     'sheetId': None,
     #     'startRowIndex': frow,
     #     'endRowIndex': lrow,
     #     'startColumnIndex': fcol+1,
     #     'endColumnIndex': lcol+1,
     # },
     'start': {
-      'sheetId': spreadsheet_info['sheets'][0]['properties']['sheetId'],
+      'sheetId': None,
       'rowIndex': frow,
       'columnIndex': fcol
     },
     'rows': [],
-    'fields': 'userEnteredFormat'
+    'fields': 'userEnteredFormat.backgroundColor'
 }
 
 
 # print(json.dumps(edits_map, indent=2))
 for crow in range(frow, lrow + 1):
     crow_data = [None] * (lcol - fcol + 1)
-    changed = False
 
     for cidx, ccol in enumerate(range(fcol, lcol + 1)):
-        # if edits_map[crow][ccol] is None:
-        #     continue
-
-        changed = True
         crow_data[cidx] = {}
         if edits_map[crow][ccol] is not None:
+            crow_data[cidx] = {}
             crow_data[cidx]['userEnteredFormat'] = {
                 'backgroundColor': color_taken if edits_map[crow][ccol] else color_free
             }
             #'stringValue': str(cidx)
 
-    cell_request['rows'].append({'values': crow_data} if changed else {'values': {}})
+    cell_request['rows'].append({'values': crow_data})
+print(json.dumps(cell_request, indent=2))
 
 body = {
     'valueInputOption': 'USER_ENTERED',
     'data': edit_data,
 }
+
+# Get sheet ID
+spreadsheet_info = sheet.get(spreadsheetId=SPREADSHEET_ID, ranges=[]).execute()
+cell_request['start']['sheetId'] = spreadsheet_info['sheets'][0]['properties']['sheetId']
 
 # print(json.dumps(body, indent=2))
 result = service.spreadsheets().values().batchUpdate(
