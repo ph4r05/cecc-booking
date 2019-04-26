@@ -82,6 +82,8 @@ def coords_txt(frow, fcol, lrow=None, lcol=None):
 filterer = lambda x: x['type'] in ['3', '4']
 sorter = lambda x: (x['type'], x['id'])
 
+# https://xlsxwriter.readthedocs.io/
+# https://xlsxwriter.readthedocs.io/examples.html
 workbook = xlsxwriter.Workbook('cecc2019.xlsx')
 worksheet = workbook.add_worksheet()
 
