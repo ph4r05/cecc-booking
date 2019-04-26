@@ -18,7 +18,7 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 # The ID and range of a sample spreadsheet.
 SPREADSHEET_ID = '1mfH5Ql6QbWK95xVtbxLmVbBLM84PRRmHPk3O74cLswA'
 show_names = False
-show_lectors = False
+show_lectors = True
 
 booking_data = json.load(open('bookings.json'))
 
