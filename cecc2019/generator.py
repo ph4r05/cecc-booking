@@ -4,6 +4,9 @@ import json
 import collections
 import sys
 import math
+import logging
+import argparse
+import coloredlogs
 
 import pickle
 import os.path
@@ -17,10 +20,21 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
 # The ID and range of a sample spreadsheet.
 SPREADSHEET_ID = '1mfH5Ql6QbWK95xVtbxLmVbBLM84PRRmHPk3O74cLswA'
+ADMINSPREADSHEET_ID = '1dHCTgInqqmSyLMS64eGgWucA2PzNtsyfei-yUew0EfI'
 show_names = False
 show_lectors = True
 
+logger = logging.getLogger(__name__)
+coloredlogs.CHROOT_FILES = []
+coloredlogs.install(level=logging.WARNING, use_chroot=False)
+
 booking_data = json.load(open('bookings.json'))
+
+parser = argparse.ArgumentParser(description="CECC 2019 accommodation booking script")
+parser.add_argument("--load", dest="load", default=False, action="store_const", const=True, help="Load bookings from the Admin spreadsheet",)
+parser.add_argument("--no-sync", dest="no_sync", default=False, action="store_const", const=True, help="No Google sync",)
+args = parser.parse_args()
+
 
 stars = [
     'MiaKhalifa',
@@ -81,57 +95,6 @@ def coords_txt(frow, fcol, lrow=None, lcol=None):
 
 filterer = lambda x: x['type'] in ['3', '4']
 sorter = lambda x: (x['type'], x['id'])
-
-# https://xlsxwriter.readthedocs.io/
-# https://xlsxwriter.readthedocs.io/examples.html
-workbook = xlsxwriter.Workbook('cecc2019.xlsx')
-worksheet = workbook.add_worksheet()
-
-merge_format = workbook.add_format({
-    'bold': 1,
-    'border': 1,
-    'align': 'center',
-    'valign': 'vcenter',
-    'font_size': 14,
-})
-
-room_type_format = workbook.add_format({
-    'bold': 1,
-    'border': 1,
-    'align': 'center',
-    'valign': 'vcenter',
-})
-
-room_id_format = workbook.add_format({
-    'bold': 0,
-    'border': 0,
-    'align': 'center',
-    'valign': 'vcenter',
-})
-
-names_format = workbook.add_format({
-    'bold': 0,
-    'border': 0,
-    'align': 'left',
-    'valign': 'vcenter',
-})
-
-name_format = workbook.add_format({
-    'bold': 0,
-    'border': 0,
-    'align': 'left',
-    'valign': 'vcenter',
-    'fg_color': 'red',
-})
-
-name_format_empty = workbook.add_format({
-    'bold': 0,
-    'border': 0,
-    'align': 'left',
-    'valign': 'vcenter',
-    'fg_color': 'green',
-})
-
 color_taken = {
     'red': 1,
     'green': 0,
@@ -148,7 +111,7 @@ color_free = {
 
 
 class Renderer(object):
-    def __init__(self, worksheet, offset, key, rooms, double_col=True):
+    def __init__(self, worksheet, offset, key, rooms, double_col=True, booking=None):
         self.worksheet = worksheet
         self.room_size = max([x['beds'] for x in rooms])
         self.double_col = double_col
@@ -158,15 +121,16 @@ class Renderer(object):
         self.rooms = rooms
         self.room_offset = None
         self.offset_final = None
+        self.booking = booking
         self.edits = []
 
     def draw_type(self):
-        self.worksheet.merge_range(self.offset, 0, self.offset, self.title_span - 1, get_room_label(self.key), room_type_format)
+        self.worksheet.merge_range(self.offset, 0, self.offset, self.title_span - 1, get_room_label(self.key), self.booking.room_type_format)
         self.offset += 1
 
     def draw_headings(self):
         self.worksheet.write_string(self.offset, 0, 'Room ID')
-        self.worksheet.merge_range(self.offset, 1, self.offset, 3, 'Name Surname', names_format)
+        self.worksheet.merge_range(self.offset, 1, self.offset, 3, 'Name Surname', self.booking.names_format)
         self.offset += 1
 
         if not self.double_col:
@@ -174,7 +138,7 @@ class Renderer(object):
 
         self.offset -= 1
         self.worksheet.write_string(self.offset, 5, 'Room ID')
-        self.worksheet.merge_range(self.offset, 6, self.offset, 8, 'Name Surname', names_format)
+        self.worksheet.merge_range(self.offset, 6, self.offset, 8, 'Name Surname', self.booking.names_format)
         self.offset += 1
 
     def begin_rooms(self):
@@ -201,13 +165,13 @@ class Renderer(object):
         num_beds = room['beds']
 
         # room id
-        self.worksheet.merge_range(coords[1], coords[0], coords[1] + self.room_size - 1, coords[0], room_id, room_id_format)
+        self.worksheet.merge_range(coords[1], coords[0], coords[1] + self.room_size - 1, coords[0], room_id, self.booking.room_id_format)
 
         offset = coords[1]
         for cbed in range(num_beds):
             cstr = 'Free' if cbed >= num_ppl else (room['people'][cbed] if show_names else 'Taken')
             cstr = '%d. %s' % (cbed + 1, cstr)
-            cstyle = name_format_empty if cbed >= num_ppl else name_format
+            cstyle = self.booking.name_format_empty if cbed >= num_ppl else self.booking.name_format
 
             self.edits.append({
                 'row': offset, 'col': coords[0] + 1, 'lcol': coords[0] + 1,
@@ -218,140 +182,228 @@ class Renderer(object):
         self.offset = offset
 
 
-worksheet.merge_range('A1:I1', 'CECC 2019 Bookings', merge_format)
-# worksheet.set_column(0, 1, 10)
+class Bookings:
+    def __init__(self):
+        # https://xlsxwriter.readthedocs.io/
+        # https://xlsxwriter.readthedocs.io/examples.html
+        self.workbook = None
+        self.worksheet = None
+        self.args = None
+        self.creds = None
+        self.edits = None
+        self.merge_format = None
+        self.room_type_format = None
+        self.room_id_format = None
+        self.names_format = None
+        self.name_format = None
+        self.name_format_empty = None
 
-offset = 1
-booking_data.sort(key=sorter)
-booking_data_disp = booking_data if show_lectors else filter(filterer, booking_data)
-edits = []
+    def work(self, args):
+        self.args = args
+        self.gen()
 
-for k, g in itertools.groupby(booking_data_disp, key=lambda x: x['type']):
-    g = list(g)
-    renderer = Renderer(worksheet, offset, k, g, True)
-    renderer.draw_type()
-    renderer.draw_headings()
-    renderer.begin_rooms()
-    for i in range(len(g)):
-        renderer.draw_room(i)
+        if self.args.no_sync:
+            return
 
-    offset = renderer.offset + 1
-    edits += renderer.edits
+        self.load_creds()
+        self.sync_write()
 
-workbook.close()
-# print(json.dumps(edits, indent=2))
+    def gen_styles(self):
+        self.merge_format = self.workbook.add_format({
+            'bold': 1,
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter',
+            'font_size': 14,
+        })
 
-# Google Docs code
-# https://developers.google.com/sheets/api/samples/writing
-# https://developers.google.com/sheets/api/guides/values#writing
-# https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/request#PasteDataRequest
-# https://developers.google.com/sheets/api/guides/batchupdate
-# https://developers.google.com/resources/api-libraries/documentation/sheets/v4/python/latest/sheets_v4.spreadsheets.html#batchUpdate
+        self.room_type_format = self.workbook.add_format({
+            'bold': 1,
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter',
+        })
 
-creds = None
-# The file token.pickle stores the user's access and refresh tokens, and is
-# created automatically when the authorization flow completes for the first
-# time.
-if os.path.exists('token.pickle'):
-    with open('token.pickle', 'rb') as token:
-        creds = pickle.load(token)
+        self.room_id_format = self.workbook.add_format({
+            'bold': 0,
+            'border': 0,
+            'align': 'center',
+            'valign': 'vcenter',
+        })
 
-# If there are no (valid) credentials available, let the user log in.
-if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            'credentials.json', SCOPES)
-        creds = flow.run_local_server()
+        self.names_format = self.workbook.add_format({
+            'bold': 0,
+            'border': 0,
+            'align': 'left',
+            'valign': 'vcenter',
+        })
 
-    # Save the credentials for the next run
-    with open('token.pickle', 'wb') as token:
-        pickle.dump(creds, token)
+        self.name_format = self.workbook.add_format({
+            'bold': 0,
+            'border': 0,
+            'align': 'left',
+            'valign': 'vcenter',
+            'fg_color': 'red',
+        })
+
+        self.name_format_empty = self.workbook.add_format({
+            'bold': 0,
+            'border': 0,
+            'align': 'left',
+            'valign': 'vcenter',
+            'fg_color': 'green',
+        })
+
+    def gen(self):
+        self.workbook = xlsxwriter.Workbook('cecc2019.xlsx')
+        self.worksheet = self.workbook.add_worksheet()
+        self.gen_styles()
+        self.worksheet.merge_range('A1:I1', 'CECC 2019 Bookings', self.merge_format)
+        # self.worksheet.set_column(0, 1, 10)
+
+        offset = 1
+        booking_data.sort(key=sorter)
+        booking_data_disp = booking_data if show_lectors else filter(filterer, booking_data)
+        self.edits = []
+
+        for k, g in itertools.groupby(booking_data_disp, key=lambda x: x['type']):
+            g = list(g)
+            renderer = Renderer(self.worksheet, offset, k, g, True, booking=self)
+            renderer.draw_type()
+            renderer.draw_headings()
+            renderer.begin_rooms()
+            for i in range(len(g)):
+                renderer.draw_room(i)
+
+            offset = renderer.offset + 1
+            self.edits += renderer.edits
+
+        self.workbook.close()
+        # print(json.dumps(edits, indent=2))
+
+    def load_creds(self):
+        # Google Docs code
+        # https://developers.google.com/sheets/api/samples/writing
+        # https://developers.google.com/sheets/api/guides/values#writing
+        # https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/request#PasteDataRequest
+        # https://developers.google.com/sheets/api/guides/batchupdate
+        # https://developers.google.com/resources/api-libraries/documentation/sheets/v4/python/latest/sheets_v4.spreadsheets.html#batchUpdate
+
+        self.creds = None
+        # The file token.pickle stores the user's access and refresh tokens, and is
+        # created automatically when the authorization flow completes for the first
+        # time.
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                self.creds = pickle.load(token)
+
+        # If there are no (valid) credentials available, let the user log in.
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                self.creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json', SCOPES)
+                self.creds = flow.run_local_server()
+
+            # Save the credentials for the next run
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(self.creds, token)
+
+    def sync_write(self):
+        service = build('sheets', 'v4', credentials=self.creds)
+
+        # Call the Sheets API
+        sheet = service.spreadsheets()
+
+        edit_data = []
+        edits_map = collections.defaultdict(lambda: collections.defaultdict(lambda: None))
+        for ed in self.edits:
+            edit_data.append({
+                'range': 'Sheet1!%s' % coords_txt(ed['row'] + 1, ed['col']),
+                'values': [[ed['body']]]
+            })
+
+            for i in range(ed['col'], ed['lcol']+1):
+                edits_map[ed['row']][i] = ed['taken']
+
+        first_edit_row = min(self.edits, key=lambda x: x['row'])
+        last_edit_row = max(self.edits, key=lambda x: x['row'])
+        first_edit_col = min(self.edits, key=lambda x: x['col'])
+        last_edit_col = max(self.edits, key=lambda x: x['col'])
+        frow, fcol = first_edit_row['row'], first_edit_col['col']
+        lrow, lcol = last_edit_row['row'], last_edit_col['col']
+
+        cell_request = {
+            # 'range': {
+            #     'sheetId': None,
+            #     'startRowIndex': frow,
+            #     'endRowIndex': lrow,
+            #     'startColumnIndex': fcol+1,
+            #     'endColumnIndex': lcol+1,
+            # },
+            'start': {
+              'sheetId': None,
+              'rowIndex': frow,
+              'columnIndex': fcol
+            },
+            'rows': [],
+            'fields': 'userEnteredFormat.backgroundColor'
+        }
+
+        # print(json.dumps(edits_map, indent=2))
+        for crow in range(frow, lrow + 1):
+            crow_data = [None] * (lcol - fcol + 1)
+
+            for cidx, ccol in enumerate(range(fcol, lcol + 1)):
+                crow_data[cidx] = {}
+                if edits_map[crow][ccol] is not None:
+                    crow_data[cidx] = {}
+                    crow_data[cidx]['userEnteredFormat'] = {
+                        'backgroundColor': color_taken if edits_map[crow][ccol] else color_free
+                    }
+                    #'stringValue': str(cidx)
+
+            cell_request['rows'].append({'values': crow_data})
+        print(json.dumps(cell_request, indent=2))
+
+        body = {
+            'valueInputOption': 'USER_ENTERED',
+            'data': edit_data,
+        }
+
+        # Get sheet ID
+        spreadsheet_info = sheet.get(spreadsheetId=SPREADSHEET_ID, ranges=[]).execute()
+        cell_request['start']['sheetId'] = spreadsheet_info['sheets'][0]['properties']['sheetId']
+
+        # print(json.dumps(body, indent=2))
+        result = service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body=body).execute()
+        print('{0} cells updated.'.format(result.get('updatedCells')))
+
+        print(json.dumps(cell_request))#, indent=2))
+        result = service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body={
+                'requests': [
+                    {'updateCells': cell_request},
+                ]
+            }).execute()
+        print('{0} cells updated.'.format(result.get('updatedCells')))
+
+        # result = sheet.values().get(spreadsheetId=SAMPLE_SPREADSHEET_ID,
+        #                             range=RANGE_NAME).execute()
+        # print(result)
+
+        print(json.dumps(booking_data, indent=2))
 
 
-service = build('sheets', 'v4', credentials=creds)
-
-# Call the Sheets API
-sheet = service.spreadsheets()
-
-edit_data = []
-edits_map = collections.defaultdict(lambda: collections.defaultdict(lambda: None))
-for ed in edits:
-    edit_data.append({
-        'range': 'Sheet1!%s' % coords_txt(ed['row'] + 1, ed['col']),
-        'values': [[ed['body']]]
-    })
-
-    for i in range(ed['col'], ed['lcol']+1):
-        edits_map[ed['row']][i] = ed['taken']
-
-first_edit_row = min(edits, key=lambda x: x['row'])
-last_edit_row = max(edits, key=lambda x: x['row'])
-first_edit_col = min(edits, key=lambda x: x['col'])
-last_edit_col = max(edits, key=lambda x: x['col'])
-frow, fcol = first_edit_row['row'], first_edit_col['col']
-lrow, lcol = last_edit_row['row'], last_edit_col['col']
-
-cell_request = {
-    # 'range': {
-    #     'sheetId': None,
-    #     'startRowIndex': frow,
-    #     'endRowIndex': lrow,
-    #     'startColumnIndex': fcol+1,
-    #     'endColumnIndex': lcol+1,
-    # },
-    'start': {
-      'sheetId': None,
-      'rowIndex': frow,
-      'columnIndex': fcol
-    },
-    'rows': [],
-    'fields': 'userEnteredFormat.backgroundColor'
-}
+def main(args):
+    booking = Bookings()
+    booking.work(args)
+    # loop = asyncio.get_event_loop()
+    # loop.run_until_complete(amain(args))
+    # loop.close()
 
 
-# print(json.dumps(edits_map, indent=2))
-for crow in range(frow, lrow + 1):
-    crow_data = [None] * (lcol - fcol + 1)
-
-    for cidx, ccol in enumerate(range(fcol, lcol + 1)):
-        crow_data[cidx] = {}
-        if edits_map[crow][ccol] is not None:
-            crow_data[cidx] = {}
-            crow_data[cidx]['userEnteredFormat'] = {
-                'backgroundColor': color_taken if edits_map[crow][ccol] else color_free
-            }
-            #'stringValue': str(cidx)
-
-    cell_request['rows'].append({'values': crow_data})
-print(json.dumps(cell_request, indent=2))
-
-body = {
-    'valueInputOption': 'USER_ENTERED',
-    'data': edit_data,
-}
-
-# Get sheet ID
-spreadsheet_info = sheet.get(spreadsheetId=SPREADSHEET_ID, ranges=[]).execute()
-cell_request['start']['sheetId'] = spreadsheet_info['sheets'][0]['properties']['sheetId']
-
-# print(json.dumps(body, indent=2))
-result = service.spreadsheets().values().batchUpdate(
-    spreadsheetId=SPREADSHEET_ID, body=body).execute()
-print('{0} cells updated.'.format(result.get('updatedCells')))
-
-print(json.dumps(cell_request))#, indent=2))
-result = service.spreadsheets().batchUpdate(
-    spreadsheetId=SPREADSHEET_ID, body={
-        'requests': [
-            {'updateCells': cell_request},
-        ]
-    }).execute()
-print('{0} cells updated.'.format(result.get('updatedCells')))
-
-# result = sheet.values().get(spreadsheetId=SAMPLE_SPREADSHEET_ID,
-#                             range=RANGE_NAME).execute()
-# print(result)
-
-print(json.dumps(booking_data, indent=2))
+if __name__ == "__main__":
+    main(args)
