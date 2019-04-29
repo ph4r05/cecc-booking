@@ -28,7 +28,7 @@ show_lectors = True
 
 logger = logging.getLogger(__name__)
 coloredlogs.CHROOT_FILES = []
-coloredlogs.install(level=logging.WARNING, use_chroot=False)
+coloredlogs.install(level=logging.INFO, use_chroot=False)
 
 parser = argparse.ArgumentParser(description="CECC 2019 accommodation booking script")
 parser.add_argument("--load", dest="load", default=False, action="store_const", const=True, help="Load bookings from the Admin spreadsheet",)
@@ -245,6 +245,7 @@ class Bookings:
         self.name_format_empty = None
 
     def work(self, args):
+        logger.info('---------------- Work started')
         self.args = args
         self.booking_data = json.load(open('bookings.json'))
         self.booking_data.sort(key=sorter)
@@ -435,7 +436,7 @@ class Bookings:
                     #'stringValue': str(cidx)
 
             cell_request['rows'].append({'values': crow_data})
-        print(json.dumps(cell_request, indent=2))
+        # print(json.dumps(cell_request, indent=2))
 
         body = {
             'valueInputOption': 'USER_ENTERED',
@@ -456,7 +457,7 @@ class Bookings:
         if self.do_conditional_formatting:
             return
 
-        print(json.dumps(cell_request))#, indent=2))
+        #print(json.dumps(cell_request))#, indent=2))
         result = service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id, body={
                 'requests': [
@@ -464,7 +465,7 @@ class Bookings:
                 ]
             }).execute()
         print('{0} cells updated.'.format(result.get('updatedCells')))
-        print(json.dumps(self.booking_data, indent=2))
+        # print(json.dumps(self.booking_data, indent=2))
 
     def sync_read(self):
         service = build('sheets', 'v4', credentials=self.creds)
