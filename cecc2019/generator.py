@@ -3,6 +3,8 @@ import itertools
 import json
 import collections
 import sys
+import re
+import copy
 import math
 import logging
 import argparse
@@ -21,14 +23,12 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 # The ID and range of a sample spreadsheet.
 SPREADSHEET_ID = '1mfH5Ql6QbWK95xVtbxLmVbBLM84PRRmHPk3O74cLswA'
 ADMINSPREADSHEET_ID = '1dHCTgInqqmSyLMS64eGgWucA2PzNtsyfei-yUew0EfI'
-show_names = False
+show_names = True
 show_lectors = True
 
 logger = logging.getLogger(__name__)
 coloredlogs.CHROOT_FILES = []
 coloredlogs.install(level=logging.WARNING, use_chroot=False)
-
-booking_data = json.load(open('bookings.json'))
 
 parser = argparse.ArgumentParser(description="CECC 2019 accommodation booking script")
 parser.add_argument("--load", dest="load", default=False, action="store_const", const=True, help="Load bookings from the Admin spreadsheet",)
@@ -93,6 +93,19 @@ def coords_txt(frow, fcol, lrow=None, lcol=None):
     return base
 
 
+def strip_index(txt):
+    m = re.match('^\s*\d+\.\s*(.*)$', txt)
+    return m.group(1) if m else txt
+
+
+def is_bed_free(txt):
+    if 'free' in txt.lower() or len(txt.strip()) == 0:
+        return True
+    if re.match('^\s*\d+\.\s*$', txt) is not None:
+        return True
+    return False
+
+
 filterer = lambda x: x['type'] in ['3', '4']
 sorter = lambda x: (x['type'], x['id'])
 color_taken = {
@@ -122,6 +135,7 @@ class Renderer(object):
         self.room_offset = None
         self.offset_final = None
         self.booking = booking
+        self.do_conditional_formatting = False
         self.edits = []
 
     def draw_type(self):
@@ -161,7 +175,7 @@ class Renderer(object):
         coords = self.get_room_start(idx)
         room = self.rooms[idx]
         room_id = '%s' % get_room_id(room['id'])
-        num_ppl = len(room['people'])
+        num_ppl = min(len(room['people']), sum([1 for x in room['people'] if x is not None]))
         num_beds = room['beds']
 
         # room id
@@ -169,15 +183,43 @@ class Renderer(object):
 
         offset = coords[1]
         for cbed in range(num_beds):
-            cstr = 'Free' if cbed >= num_ppl else (room['people'][cbed] if show_names else 'Taken')
+            cstr = 'Free' if cbed >= num_ppl else (room['people'][cbed] if self.booking.show_names else 'Taken')
             cstr = '%d. %s' % (cbed + 1, cstr)
             cstyle = self.booking.name_format_empty if cbed >= num_ppl else self.booking.name_format
 
             self.edits.append({
                 'row': offset, 'col': coords[0] + 1, 'lcol': coords[0] + 1,
-                'body': cstr, 'taken': cbed < num_ppl
+                'body': cstr, 'taken': cbed < num_ppl,
+                'num_ppl': num_ppl,
+                'cbed': cbed,
+                'person': room['people'][cbed] if cbed < num_ppl else None,
+                'room_idx': idx,
+                'room_key': self.key,
+                'room_id': room['id'],
             })
-            self.worksheet.merge_range(offset, coords[0] + 1, offset, coords[0] + 3, cstr, cstyle)
+
+            self.worksheet.merge_range(offset, coords[0] + 1, offset, coords[0] + 3, cstr, cstyle if not self.do_conditional_formatting else None)
+
+            # https://xlsxwriter.readthedocs.io/example_conditional_format.html
+            if self.do_conditional_formatting:
+                self.worksheet.conditional_format(
+                    offset, coords[0] + 1, offset, coords[0] + 1, {
+                        'type': 'text',
+                        'criteria': 'containsText',
+                        'value': 'Free',
+                        'format': self.booking.name_format_empty_bg
+                    }
+                )
+
+                self.worksheet.conditional_format(
+                    offset, coords[0] + 1, offset, coords[0] + 1, {
+                        'type': 'text',
+                        'criteria': 'notContains',
+                        'value': 'Free',
+                        'format': self.booking.name_format_bg
+                    }
+                )
+
             offset += 1
         self.offset = offset
 
@@ -190,6 +232,10 @@ class Bookings:
         self.worksheet = None
         self.args = None
         self.creds = None
+        self.show_names = show_names
+        self.do_sync_to_admin = False
+        self.do_conditional_formatting = True
+        self.booking_data = None
         self.edits = None
         self.merge_format = None
         self.room_type_format = None
@@ -200,12 +246,30 @@ class Bookings:
 
     def work(self, args):
         self.args = args
+        self.booking_data = json.load(open('bookings.json'))
+        self.booking_data.sort(key=sorter)
+
+        self.show_names = self.do_sync_to_admin
         self.gen()
 
         if self.args.no_sync:
             return
 
         self.load_creds()
+
+        # Sync current JSON to admin spreadsheet.
+        # Warning: clears current modifications.
+        if self.do_sync_to_admin:
+            self.sync_write(ADMINSPREADSHEET_ID)
+
+        # Reads values from the admin spreadsheet.
+        self.sync_read()
+
+        # Re-generate with the anonymous names, fetched from admin
+        # Re-generate excel sheet so we have anonymous ready for upload, with new
+        # updated data.
+        self.show_names = False
+        self.gen()
         self.sync_write()
 
     def gen_styles(self):
@@ -254,6 +318,14 @@ class Bookings:
             'fg_color': 'green',
         })
 
+        self.name_format_bg = self.workbook.add_format({
+            'bg_color': 'red'
+        })
+
+        self.name_format_empty_bg = self.workbook.add_format({
+            'bg_color': 'green'
+        })
+
     def gen(self):
         self.workbook = xlsxwriter.Workbook('cecc2019.xlsx')
         self.worksheet = self.workbook.add_worksheet()
@@ -262,13 +334,13 @@ class Bookings:
         # self.worksheet.set_column(0, 1, 10)
 
         offset = 1
-        booking_data.sort(key=sorter)
-        booking_data_disp = booking_data if show_lectors else filter(filterer, booking_data)
+        booking_data_disp = self.booking_data if show_lectors else filter(filterer, self.booking_data)
         self.edits = []
 
         for k, g in itertools.groupby(booking_data_disp, key=lambda x: x['type']):
             g = list(g)
             renderer = Renderer(self.worksheet, offset, k, g, True, booking=self)
+            renderer.do_conditional_formatting = self.do_conditional_formatting
             renderer.draw_type()
             renderer.draw_headings()
             renderer.begin_rooms()
@@ -310,10 +382,8 @@ class Bookings:
             with open('token.pickle', 'wb') as token:
                 pickle.dump(self.creds, token)
 
-    def sync_write(self):
+    def sync_write(self, spreadsheet_id=SPREADSHEET_ID):
         service = build('sheets', 'v4', credentials=self.creds)
-
-        # Call the Sheets API
         sheet = service.spreadsheets()
 
         edit_data = []
@@ -373,28 +443,75 @@ class Bookings:
         }
 
         # Get sheet ID
-        spreadsheet_info = sheet.get(spreadsheetId=SPREADSHEET_ID, ranges=[]).execute()
+        spreadsheet_info = sheet.get(spreadsheetId=spreadsheet_id, ranges=[]).execute()
         cell_request['start']['sheetId'] = spreadsheet_info['sheets'][0]['properties']['sheetId']
 
-        # print(json.dumps(body, indent=2))
+        # Sheet text data udpate
         result = service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, body=body).execute()
+            spreadsheetId=spreadsheet_id, body=body).execute()
         print('{0} cells updated.'.format(result.get('updatedCells')))
+
+        # Sheet formatting update
+        # Update is not needed if we have conditional formatting.
+        if self.do_conditional_formatting:
+            return
 
         print(json.dumps(cell_request))#, indent=2))
         result = service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, body={
+            spreadsheetId=spreadsheet_id, body={
                 'requests': [
                     {'updateCells': cell_request},
                 ]
             }).execute()
         print('{0} cells updated.'.format(result.get('updatedCells')))
+        print(json.dumps(self.booking_data, indent=2))
 
-        # result = sheet.values().get(spreadsheetId=SAMPLE_SPREADSHEET_ID,
-        #                             range=RANGE_NAME).execute()
-        # print(result)
+    def sync_read(self):
+        service = build('sheets', 'v4', credentials=self.creds)
+        sheet = service.spreadsheets()
 
-        print(json.dumps(booking_data, indent=2))
+        booking_map = collections.defaultdict(lambda: None)  # room id -> room
+        edits_map = collections.defaultdict(lambda: collections.defaultdict(lambda: None))
+        for ed in self.edits:
+            for i in range(ed['col'], ed['lcol'] + 1):
+                edits_map[ed['row']][i] = ed
+
+        for bo in self.booking_data:
+            room_copy = copy.deepcopy(bo)
+            room_copy['people'] = []  # clear as we are going to append
+            booking_map[bo['id']] = room_copy
+
+        result = sheet.values().get(spreadsheetId=ADMINSPREADSHEET_ID,
+                                    range='!A1:I').execute()
+
+        if result['majorDimension'] != 'ROWS':
+            raise ValueError('Not supported')
+
+        rows = result['values']
+        for irow, row in enumerate(rows):
+            for icol, col in enumerate(row):
+                if edits_map[irow][icol] is None:
+                    continue
+
+                rec = edits_map[irow][icol]
+                room_id = rec['room_id']
+
+                if booking_map[room_id] is None:
+                    logger.warning('Room ID %s not found in booking data' % room_id)
+                    continue
+
+                room = booking_map[room_id]
+                is_free = is_bed_free(col)
+                cname = strip_index(col)
+                room['people'].append((rec['cbed'], None if is_free else cname))
+
+        for room_id in booking_map:
+            room = booking_map[room_id]
+            room['people'] = [x[1] for x in sorted(room['people'], key=lambda x: x[0])]
+
+        rooms = [x[2] for x in sorted([(booking_map[room_id]['type'], room_id, booking_map[room_id]) for room_id in booking_map])]
+        self.booking_data = rooms
+        json.dump(rooms, open('bookings_fetched.json', 'w+'), indent=2)
 
 
 def main(args):
